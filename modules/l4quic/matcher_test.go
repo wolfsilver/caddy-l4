@@ -15,6 +15,7 @@
 package l4quic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,19 @@ func assertNoError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("Unexpected error: %s\n", err)
+	}
+}
+
+func TestQuicPipeWriterAllowsShortFollowUpDatagrams(t *testing.T) {
+	payload := []byte{0x01}
+	var dst bytes.Buffer
+
+	n, err := (quicPipeWriter{Writer: &dst}).Write(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(payload) || !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("expected %d bytes %x, got %d bytes %x", len(payload), payload, n, dst.Bytes())
 	}
 }
 
