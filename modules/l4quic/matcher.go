@@ -66,13 +66,16 @@ func (m *MatchQUIC) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// quicPipeWriter checks the length of the passed in buffer before writing
+// quicPipeWriter limits replayed datagrams to quic-go's receive buffer size.
 type quicPipeWriter struct {
 	io.Writer
 }
 
 func (q quicPipeWriter) Write(p []byte) (int, error) {
-	if len(p) < QUICPacketBytesMin || len(p) > QUICPacketBytesMax {
+	// Only packets containing a QUIC Initial packet must meet the minimum
+	// datagram size. Follow-up packets, such as 0-RTT and Handshake packets,
+	// may be shorter.
+	if len(p) > QUICPacketBytesMax {
 		return 0, errors.New("invalid length for quic packet")
 	}
 	return q.Writer.Write(p)
