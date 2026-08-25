@@ -2,6 +2,7 @@ package layer4
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"testing"
 
@@ -89,5 +90,36 @@ func TestConnection_FreezeAndUnfreeze(t *testing.T) {
 	}
 	if !bytes.Equal(consumeData, buf) {
 		t.Fatalf("expected %s but received %s", consumeData, buf)
+	}
+}
+
+func TestConnection_WaitForMorePreservesPacketFrameSize(t *testing.T) {
+	const packetSize = 1300
+
+	pc := &packetConn{
+		readCh: make(chan *packet, 1),
+	}
+	pc.lastBufSize = 1200
+	pc.readCh <- &packet{
+		pooledBuf: make([]byte, packetSize),
+		n:         packetSize,
+	}
+
+	cx := &Connection{
+		Conn:         pc,
+		isPacketConn: true,
+		Logger:       zap.NewNop(),
+		buf:          make([]byte, 0, prefetchChunkSize),
+	}
+
+	if err := cx.WaitForMore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cx.prefetch(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(cx.frameSizes) != 1 || cx.frameSizes[0] != packetSize {
+		t.Fatalf("expected frame size %d, got %v", packetSize, cx.frameSizes)
 	}
 }

@@ -258,6 +258,7 @@ func (cx *Connection) WaitForMore(ctx context.Context) error {
 			buf := bytes.NewReader(pkt.pooledBuf[:pkt.n])
 			pc.lastPacket = pkt
 			pc.lastBuf = buf
+			pc.lastBufSize = pkt.n
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
