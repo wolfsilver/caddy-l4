@@ -32,6 +32,67 @@ func (m *testIoMatcher) Match(cx *Connection) (bool, error) {
 	return n > 0, err
 }
 
+type retryAfterPacketMatcher struct {
+	calls int
+}
+
+func (m *retryAfterPacketMatcher) Match(cx *Connection) (bool, error) {
+	m.calls++
+	buf := make([]byte, 16)
+	n, err := io.ReadAtLeast(cx, buf, 1)
+	if err != nil {
+		return false, err
+	}
+	if m.calls == 1 {
+		return false, ErrConsumedAllPrefetchedBytes
+	}
+	return n > 0 && buf[0] == 'I', nil
+}
+
+func TestCompilePreservesInitialUDPPacketAcrossMatcherRetry(t *testing.T) {
+	matcher := &retryAfterPacketMatcher{}
+	routes := RouteList{&Route{
+		matcherSets: MatcherSets{{matcher}},
+	}}
+
+	var received []byte
+	compiledRoutes := routes.Compile(zap.NewNop(), time.Second,
+		HandlerFunc(func(cx *Connection) error {
+			buf := make([]byte, len("Initial"))
+			n, err := io.ReadFull(cx, buf)
+			received = append(received, buf[:n]...)
+			return err
+		}))
+
+	underlying, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer func() { _ = underlying.Close() }()
+
+	pc := &packetConn{
+		PacketConn:  underlying,
+		addr:        &net.UDPAddr{},
+		readCh:      make(chan *packet, 2),
+		closeCh:     make(chan string, 1),
+		idleTimeout: time.Second,
+	}
+	pc.readCh <- &packet{pooledBuf: []byte("Initial"), n: len("Initial")}
+	pc.readCh <- &packet{pooledBuf: []byte("Followup"), n: len("Followup")}
+
+	cx := WrapConnection(pc, []byte{}, zap.NewNop())
+	if err := compiledRoutes.Handle(cx); err != nil {
+		t.Fatalf("handle failed: %v", err)
+	}
+
+	if matcher.calls != 2 {
+		t.Fatalf("expected 2 matcher calls, got %d", matcher.calls)
+	}
+	if string(received) != "Initial" {
+		t.Fatalf("expected handler to receive Initial, got %q", received)
+	}
+}
+
 func TestMatchingTimeoutWorks(t *testing.T) {
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()

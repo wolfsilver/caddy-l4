@@ -29,6 +29,8 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -380,31 +382,70 @@ func (fpa fakePipeAddr) String() string {
 	return fmt.Sprintf("fake_%v_%v", fpa.ID.String(), fpa.TS.UnixNano())
 }
 
-// fakePacketConn wraps around net.Conn and satisfies net.PacketConn.
+// fakePacketConn is an in-memory packet connection used by the QUIC matcher.
 type fakePacketConn struct {
-	net.Conn
+	local  net.Addr
+	remote net.Addr
+	peer   *fakePacketConn
 
-	Local  net.Addr
-	Remote net.Addr
+	readCh  chan []byte
+	done    chan struct{}
+	readBuf []byte
+
+	closeOnce     sync.Once
+	deadlineMu    sync.Mutex
+	readDeadline  time.Time
+	writeDeadline time.Time
 }
 
 func (fpc *fakePacketConn) LocalAddr() net.Addr {
-	if fpc.Local != nil {
-		return fpc.Local
-	}
-	return fpc.Conn.LocalAddr()
+	return fpc.local
 }
 
 func (fpc *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, err := fpc.Read(p)
-	return n, fpc.RemoteAddr(), err
+	fpc.deadlineMu.Lock()
+	deadline := fpc.readDeadline
+	fpc.deadlineMu.Unlock()
+
+	var deadlineCh <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+
+	select {
+	case packet := <-fpc.readCh:
+		return copy(p, packet), fpc.RemoteAddr(), nil
+	case <-fpc.done:
+		return 0, nil, net.ErrClosed
+	case <-fpc.peer.done:
+		return 0, nil, io.EOF
+	case <-deadlineCh:
+		return 0, nil, os.ErrDeadlineExceeded
+	}
 }
 
 func (fpc *fakePacketConn) RemoteAddr() net.Addr {
-	if fpc.Remote != nil {
-		return fpc.Remote
+	return fpc.remote
+}
+
+func (fpc *fakePacketConn) Read(p []byte) (int, error) {
+	if len(fpc.readBuf) == 0 {
+		packet, _, err := fpc.readPacket()
+		if err != nil {
+			return 0, err
+		}
+		fpc.readBuf = packet
 	}
-	return fpc.Conn.RemoteAddr()
+	n := copy(p, fpc.readBuf)
+	fpc.readBuf = fpc.readBuf[n:]
+	return n, nil
+}
+
+func (fpc *fakePacketConn) Write(p []byte) (int, error) {
+	return fpc.WriteTo(p, fpc.RemoteAddr())
 }
 
 func (fpc *fakePacketConn) SetReadBuffer(_ int) error {
@@ -415,8 +456,86 @@ func (fpc *fakePacketConn) SetWriteBuffer(_ int) error {
 	return nil
 }
 
+func (fpc *fakePacketConn) SetDeadline(t time.Time) error {
+	fpc.deadlineMu.Lock()
+	fpc.readDeadline = t
+	fpc.writeDeadline = t
+	fpc.deadlineMu.Unlock()
+	return nil
+}
+
+func (fpc *fakePacketConn) SetReadDeadline(t time.Time) error {
+	fpc.deadlineMu.Lock()
+	fpc.readDeadline = t
+	fpc.deadlineMu.Unlock()
+	return nil
+}
+
+func (fpc *fakePacketConn) SetWriteDeadline(t time.Time) error {
+	fpc.deadlineMu.Lock()
+	fpc.writeDeadline = t
+	fpc.deadlineMu.Unlock()
+	return nil
+}
+
 func (fpc *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return fpc.Write(p)
+	if fpc.peer == nil {
+		return 0, net.ErrClosed
+	}
+
+	fpc.deadlineMu.Lock()
+	deadline := fpc.writeDeadline
+	fpc.deadlineMu.Unlock()
+
+	var deadlineCh <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+
+	packet := append([]byte(nil), p...)
+	select {
+	case fpc.peer.readCh <- packet:
+		return len(p), nil
+	case <-fpc.done:
+		return 0, net.ErrClosed
+	case <-fpc.peer.done:
+		return 0, net.ErrClosed
+	case <-deadlineCh:
+		return 0, os.ErrDeadlineExceeded
+	}
+}
+
+func (fpc *fakePacketConn) readPacket() ([]byte, net.Addr, error) {
+	fpc.deadlineMu.Lock()
+	deadline := fpc.readDeadline
+	fpc.deadlineMu.Unlock()
+
+	var deadlineCh <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		deadlineCh = timer.C
+	}
+
+	select {
+	case packet := <-fpc.readCh:
+		return packet, fpc.RemoteAddr(), nil
+	case <-fpc.done:
+		return nil, nil, net.ErrClosed
+	case <-fpc.peer.done:
+		return nil, nil, io.EOF
+	case <-deadlineCh:
+		return nil, nil, os.ErrDeadlineExceeded
+	}
+}
+
+func (fpc *fakePacketConn) Close() error {
+	fpc.closeOnce.Do(func() { close(fpc.done) })
+	return nil
 }
 
 // Interface guards
@@ -457,8 +576,16 @@ const (
 )
 
 func newFakePacketConnPipe(local, remote net.Addr) (*fakePacketConn, *fakePacketConn) {
-	server, client := net.Pipe()
-	serverFPC, clientFPC := &fakePacketConn{Conn: server}, &fakePacketConn{Conn: client}
+	serverFPC := &fakePacketConn{
+		readCh: make(chan []byte, 16),
+		done:   make(chan struct{}),
+	}
+	clientFPC := &fakePacketConn{
+		readCh: make(chan []byte, 16),
+		done:   make(chan struct{}),
+	}
+	serverFPC.peer = clientFPC
+	clientFPC.peer = serverFPC
 	if local != nil || remote != nil {
 		if local == nil {
 			local = remote
@@ -466,8 +593,8 @@ func newFakePacketConnPipe(local, remote net.Addr) (*fakePacketConn, *fakePacket
 		if remote == nil {
 			remote = local
 		}
-		serverFPC.Local, clientFPC.Remote = local, local
-		serverFPC.Remote, clientFPC.Local = remote, remote
+		serverFPC.local, clientFPC.remote = local, local
+		serverFPC.remote, clientFPC.local = remote, remote
 	}
 	return serverFPC, clientFPC
 }

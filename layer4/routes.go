@@ -115,8 +115,9 @@ func (routes RouteList) Compile(logger *zap.Logger, matchingTimeout time.Duratio
 			// it actually records where a matcher may require more data, i.e. the one that really needs more,
 			// the one after a matched route, the one after a not matched route with no previous routes needing more.
 			// -1 means there is no route that requires more data
-			lastNeedsMoreIdx = -1
-			routesStatus     = make(map[int]int)
+			lastNeedsMoreIdx  = -1
+			routesStatus      = make(map[int]int)
+			initialPrefetched bool
 		)
 		// this loop should only be done if there are matchers that can't determine the match,
 		// i.e. some of the matchers returned false, ErrConsumedAllPrefetchedBytes. The index which
@@ -126,6 +127,19 @@ func (routes RouteList) Compile(logger *zap.Logger, matchingTimeout time.Duratio
 		err := cx.SetReadDeadline(deadline)
 		if err != nil {
 			return err
+		}
+		if cx.isPacketConn && !initialPrefetched {
+			initialPrefetched = true
+			err = cx.prefetch()
+			if err != nil {
+				logFunc := logger.Error
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					err = ErrMatchingTimeout
+					logFunc = logger.Warn
+				}
+				logFunc("matching connection", zap.String("remote", cx.RemoteAddr().String()), zap.Error(err))
+				return nil
+			}
 		}
 		for {
 			// only read more because matchers require more (no matcher in the simplest case).
